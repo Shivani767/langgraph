@@ -314,6 +314,8 @@ def human_approval(
         )
 
     args_digest = _get_args_digest(args)
+    
+    # First, try to get the resume payload (this will be None on first call)
     resume_payload = interrupt({
         "type": "approval_request",
         "tool_name": tool_name,
@@ -325,7 +327,36 @@ def human_approval(
         "checkpoint_id": checkpoint_id,
     })
 
-    # Validate payload structure first
+    # If no resume payload (or no resume_command_id), this is the first call
+    if resume_payload is None or not isinstance(resume_payload, dict) or "resume_command_id" not in resume_payload:
+        # Generate server-side resume_command_id
+        resume_command_id = str(uuid.uuid4())
+        # Create and save the pending decision FIRST
+        pending_decision = PendingDecision(
+            checkpoint_id=checkpoint_id or str(uuid.uuid4()),
+            node_name=node_name,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args_digest=args_digest,
+            decision_shape=decision_shape,
+            resume_command_id=resume_command_id,
+            expires_at=datetime.now() + expires_in,
+        )
+        store.save(pending_decision)
+        # Now interrupt with the server-generated resume_command_id
+        resume_payload = interrupt({
+            "type": "approval_request",
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "args": args,
+            "args_digest": args_digest,
+            "decision_shape": decision_shape,
+            "node_name": node_name,
+            "checkpoint_id": checkpoint_id,
+            "resume_command_id": resume_command_id,
+        })
+
+    # Now validate the resume payload
     if not isinstance(resume_payload, dict):
         raise DecisionValidationError("Resume payload must be a dictionary")
 
@@ -338,41 +369,8 @@ def human_approval(
     pending_decision = store.get(resume_command_id)
 
     if pending_decision is None:
-        # First pass: create pending record and interrupt again
-        pending_decision = PendingDecision(
-            checkpoint_id=checkpoint_id or str(uuid.uuid4()),
-            node_name=node_name,
-            tool_name=tool_name,
-            tool_call_id=tool_call_id,
-            args_digest=args_digest,
-            decision_shape=decision_shape,
-            resume_command_id=resume_command_id,
-            expires_at=datetime.now() + expires_in,
-        )
-        store.save(pending_decision)
-        new_resume_payload = interrupt({
-            "type": "approval_request",
-            "tool_name": tool_name,
-            "tool_call_id": tool_call_id,
-            "args": args,
-            "args_digest": args_digest,
-            "decision_shape": decision_shape,
-            "node_name": node_name,
-            "checkpoint_id": checkpoint_id,
-            "resume_command_id": resume_command_id,
-        })
-        return human_approval(
-            tool_name=tool_name,
-            tool_call_id=tool_call_id,
-            args=args,
-            decision_shape=decision_shape,
-            node_name=node_name,
-            checkpoint_id=checkpoint_id,
-            store=store,
-            allow_list=allow_list,
-            deny_list=deny_list,
-            expires_in=expires_in,
-        )
+        # Fail closed - unknown resume_command_id
+        raise DecisionValidationError("Invalid resume command ID")
 
     # Validate pending decision state
     if pending_decision.state != DecisionState.PENDING:
